@@ -119,3 +119,4 @@ def handle_all_messages(message):
 
 # Start the bot polling
 bot.infinity_polling()
+    
