@@ -1,171 +1,121 @@
 import os
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+import telebot
+from telebot import types
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Get the token from Railway's environment variables
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+bot = telebot.TeleBot(BOT_TOKEN)
 
-user_data = {}
+# Track what state a user is in and their current quiz progress
+user_states = {}  # {user_id: 'STATE'}
+user_quizzes = {} # {user_id: {'subject': 'English', 'current_q': 0, 'score': 0}}
 
-QUESTIONS = {
-    "JAMB": {
-        "Maths": [
-            {
-                "q": "If 2x + 5 = 15, what is x?",
-                "a": "5",
-                "exp": "Subtract 5 from both sides to get 2x = 10. Then divide both sides by 2 to get x = 5."
-            },
-            {
-                "q": "What is 25% of 200?",
-                "a": "50",
-                "exp": "25% means 25/100. So 25/100 × 200 = 50."
-            },
-            {
-                "q": "Solve: 7² - 5²",
-                "a": "24",
-                "exp": "7² = 49 and 5² = 25. Therefore 49 - 25 = 24."
-            }
-        ],
-        "English": [
-            {
-                "q": "Choose synonym: 'Big'  a) Small  b) Large  c) Tiny",
-                "a": "b",
-                "exp": "Large has a similar meaning to Big, while Small and Tiny are opposites."
-            }
-        ]
-    },
-    "WAEC": {
-        "Maths": [
-            {
-                "q": "Find area of a circle with radius 7 cm. Use π = 22/7.",
-                "a": "154",
-                "exp": "Area = πr² = (22/7) × 7 × 7 = 154."
-            },
-            {
-                "q": "If y = 3x + 2 and x = 4, find y.",
-                "a": "14",
-                "exp": "Substitute x = 4 into y = 3(4) + 2 = 14."
-            }
-        ]
-    }
+# The Question Database
+QUESTIONS_DB = {
+    "English": [
+        {"q": "Choose synonym: Big", "options": ["a", "b", "c"], "text_opts": "a) Small\nb) Large\nc) Tiny", "ans": "b", "exp": "Large has a similar meaning to Big."},
+        {"q": "Choose antonym: Hot", "options": ["a", "b", "c"], "text_opts": "a) Cold\nb) Warm\nc) Spicy", "ans": "a", "exp": "Cold is the opposite of Hot."}
+    ],
+    "Chemistry": [
+        {"q": "What is the chemical symbol for Water?", "options": ["a", "b", "c"], "text_opts": "a) CO2\nb) H2O\nc) NaCl", "ans": "b", "exp": "H2O stands for Hydrogen and Oxygen."}
+    ],
+    "Maths": [
+        {"q": "Solve for x: 2x + 5 = 11", "options": ["a", "b", "c"], "text_opts": "a) 3\nb) 4\nc) 6", "ans": "a", "exp": "Subtract 5 from both sides: 2x = 6. Divide by 2: x = 3."}
+    ],
+    "Physics": [
+        {"q": "What is the unit of force?", "options": ["a", "b", "c"], "text_opts": "a) Joule\nb) Watt\nc) Newton", "ans": "c", "exp": "The SI unit of force is the Newton (N)."}
+    ]
 }
 
+def send_question(chat_id, user_id):
+    quiz = user_quizzes[user_id]
+    subject = quiz['subject']
+    q_index = quiz['current_q']
+    
+    question_data = QUESTIONS_DB[subject][q_index]
+    
+    # Create buttons for options A, B, C
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(types.KeyboardButton('A'), types.KeyboardButton('B'), types.KeyboardButton('C'))
+    
+    msg_text = f"Question {q_index + 1}/{len(QUESTIONS_DB[subject])}\n\n{question_data['q']}\n\n{question_data['text_opts']}"
+    bot.send_message(chat_id, msg_text, reply_markup=markup)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [["JAMB", "WAEC"]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    user_id = message.from_user.id
+    user_states[user_id] = 'CHOOSING_EXAM'
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(types.KeyboardButton('JAMB'), types.KeyboardButton('WAEC'))
+    
+    bot.send_message(message.chat.id, "📚 Welcome to ScholarAI\n\nPractice smarter. Pass with confidence.\n\nChoose an exam:", reply_markup=markup)
 
-    await update.message.reply_text(
-        "📚 Welcome to ScholarAI\n\n"
-        "Practice smarter. Pass with confidence.\n\n"
-        "Choose an exam:",
-        reply_markup=reply_markup
-    )
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    user_id = message.from_user.id
+    text = message.text
+    chat_id = message.chat.id
 
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    user_id = update.effective_user.id
-
-    # Exam Selection
-    if text in ["JAMB", "WAEC"]:
-        user_data[user_id] = {
-            "exam": text,
-            "q_index": 0,
-            "score": 0
-        }
-
-        keyboard = [["Maths", "English", "Physics"]]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-        await update.message.reply_text(
-            f"📚 {text} Selected\n\nChoose a subject:",
-            reply_markup=reply_markup
-        )
+    # If user hasn't typed /start yet
+    if user_id not in user_states:
+        bot.send_message(chat_id, "Type /start to begin your ScholarAI quiz.")
         return
 
-    # Subject Selection
-    if text in ["Maths", "English", "Physics"] and user_id in user_data:
-        exam = user_data[user_id]["exam"]
+    state = user_states[user_id]
 
-        if exam in QUESTIONS and text in QUESTIONS[exam]:
-            user_data[user_id]["subject"] = text
-            user_data[user_id]["q_index"] = 0
-
-            q = QUESTIONS[exam][text][0]
-
-            await update.message.reply_text(
-                f"Question 1/{len(QUESTIONS[exam][text])}\n\n"
-                f"{q['q']}\n\n"
-                f"Reply with your answer."
-            )
+    if state == 'CHOOSING_EXAM':
+        if text in ['JAMB', 'WAEC']:
+            user_states[user_id] = 'CHOOSING_SUBJECT'
+            markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+            markup.row(types.KeyboardButton('Maths'), types.KeyboardButton('English'))
+            markup.row(types.KeyboardButton('Physics'), types.KeyboardButton('Chemistry'))
+            bot.send_message(chat_id, f"✅ {text} Selected.\n\nChoose a subject:", reply_markup=markup)
         else:
-            await update.message.reply_text(
-                f"❌ No questions available yet for {text} in {exam}.\n"
-                f"Choose another subject."
-            )
-        return
+            bot.send_message(chat_id, "Please select JAMB or WAEC using the buttons.")
 
-    # Answer Questions
-    if user_id in user_data and "subject" in user_data[user_id]:
-        exam = user_data[user_id]["exam"]
-        subject = user_data[user_id]["subject"]
-        idx = user_data[user_id]["q_index"]
-
-        question = QUESTIONS[exam][subject][idx]
-        correct_answer = question["a"]
-        explanation = question.get("exp", "No explanation available.")
-
-        if text.lower() == correct_answer.lower():
-            user_data[user_id]["score"] += 1
-
-            await update.message.reply_text(
-                f"✅ Correct!\n\n"
-                f"💡 Explanation:\n{explanation}"
-            )
+    elif state == 'CHOOSING_SUBJECT':
+        if text in QUESTIONS_DB:
+            user_states[user_id] = 'QUIZ_ACTIVE'
+            user_quizzes[user_id] = {'subject': text, 'current_q': 0, 'score': 0}
+            bot.send_message(chat_id, f"📖 starting {text} Quiz...")
+            send_question(chat_id, user_id)
         else:
-            await update.message.reply_text(
-                f"❌ Wrong.\n\n"
-                f"✅ Correct Answer: {correct_answer}\n\n"
-                f"💡 Explanation:\n{explanation}"
-            )
+            bot.send_message(chat_id, "❌ No questions available yet for that subject. Choose another.")
 
-        idx += 1
-        total_questions = len(QUESTIONS[exam][subject])
-
-        if idx < total_questions:
-            user_data[user_id]["q_index"] = idx
-
-            next_q = QUESTIONS[exam][subject][idx]
-
-            await update.message.reply_text(
-                f"Question {idx + 1}/{total_questions}\n\n"
-                f"{next_q['q']}"
-            )
+    elif state == 'QUIZ_ACTIVE':
+        quiz = user_quizzes.get(user_id)
+        subject = quiz['subject']
+        q_index = quiz['current_q']
+        question_data = QUESTIONS_DB[subject][q_index]
+        
+        user_ans = text.lower().strip()
+        
+        if user_ans in ['a', 'b', 'c']:
+            if user_ans == question_data['ans']:
+                bot.send_message(chat_id, "✅ Correct!")
+                quiz['score'] += 1
+            else:
+                bot.send_message(chat_id, f"❌ Wrong.\n\n✅ Correct Answer: {question_data['ans']}")
+                
+            bot.send_message(chat_id, f"💡 Explanation:\n{question_data['exp']}")
+            
+            # Move to next question
+            quiz['current_q'] += 1
+            if quiz['current_q'] < len(QUESTIONS_DB[subject]):
+                send_question(chat_id, user_id)
+            else:
+                # Quiz Completed
+                score = quiz['score']
+                total = len(QUESTIONS_DB[subject])
+                pct = int((score / total) * 100)
+                
+                bot.send_message(chat_id, f"🎉 Quiz Completed!\n\n📊 Score: {score}/{total}\n📈 Percentage: {pct}%\n\nType /start to play again.", reply_markup=types.ReplyKeyboardRemove())
+                # Reset states
+                user_states.pop(user_id, None)
+                user_quizzes.pop(user_id, None)
         else:
-            score = user_data[user_id]["score"]
-            percentage = round((score / total_questions) * 100)
+            bot.send_message(chat_id, "Please answer by clicking A, B, or C.")
 
-            await update.message.reply_text(
-                f"🎉 Quiz Completed!\n\n"
-                f"📊 Score: {score}/{total_questions}\n"
-                f"📈 Percentage: {percentage}%\n\n"
-                f"Type /start to play again."
-            )
-
-            del user_data[user_id]
-
-        return
-
-    await update.message.reply_text(
-        "Type /start to begin your ScholarAI quiz."
-    )
-
-
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-if __name__ == "__main__":
-    print("ScholarAI Bot is running...")
-    app.run_polling()
+# Start the bot polling
+bot.infinity_polling()
