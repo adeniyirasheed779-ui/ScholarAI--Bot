@@ -1,17 +1,13 @@
 import os
 import csv
 import random
-import asyncio
 import sqlite3
-import base64
-import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ========== CONFIG - CHANGE THESE ==========
 TOKEN = os.getenv("BOT_TOKEN") # Get from @BotFather
 ADMIN_ID = 6975323735 # Your Telegram ID from @userinfobot
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # Get free key from platform.openai.com
 
 QUESTION_FILE = "questions.csv"
 DB_FILE = "users.db"
@@ -83,6 +79,7 @@ def load_questions():
             writer.writerow(['subject','question','option_a','option_b','option_c','option_d','answer','explanation'])
             writer.writerow(['English','Select nearest meaning to Diligent','Lazy','Hardworking','Careless','Idle','Hardworking','Diligent means showing careful persistent work.'])
             writer.writerow(['Maths','What is 2+2?','3','4','5','6','4','Basic addition'])
+            writer.writerow(['Biology','Which organ purifies blood?','Heart','Kidney','Liver','Lungs','Kidney','Kidney filters waste from blood'])
 
     with open(QUESTION_FILE, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
@@ -96,27 +93,6 @@ def load_questions():
 QUESTION_BANK = load_questions()
 user_sessions = {}
 
-# ========== AI SOLVER ==========
-async def solve_with_ai(prompt, image_b64=None):
-    if not OPENAI_API_KEY:
-        return "❌ AI not configured. Admin needs to set OPENAI_API_KEY"
-
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    content = [{"type": "text", "text": f"You are JAMB/UTME tutor. Solve this clearly: {prompt}. Give final answer with option A/B/C/D + 1-2 line explanation"}]
-
-    if image_b64:
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
-
-    payload = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": content}], "max_tokens": 350}
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload) as resp:
-                data = await resp.json()
-                return data['choices'][0]['message']['content']
-    except Exception as e:
-        return f"❌ AI Error: {str(e)}"
-
 # ========== /START ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -126,7 +102,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tier_tag = "👑 PREMIUM" if is_premium else "🆓 FREE"
     text = f"🚀 *ScholarAI JAMB/UTME Bot* [{tier_tag}]\n\n"
     text += f"Free: {FREE_LIMIT} questions per subject\nPremium: {PREMIUM_LIMIT} questions\n"
-    text += "📚 Tap subject for CBT test\n📸 Send photo of any question\n🎤 Send voice note to ask\n📊 /profile for stats"
+    text += "📚 Tap subject for CBT test\n📊 /profile for stats"
 
     keyboard = []
     for subject in QUESTION_BANK.keys():
@@ -155,59 +131,6 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode='Markdown')
     else:
         await update.callback_query.edit_message_text(text, parse_mode='Markdown')
-
-# ========== PHOTO SOLVER ==========
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not OPENAI_API_KEY:
-        await update.message.reply_text("❌ AI service not configured")
-        return
-
-    await update.message.reply_text("👀 Reading your question... 3-5 secs")
-
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    image_bytes = await file.download_as_bytearray()
-    image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-
-    answer = await solve_with_ai("Read this JAMB/UTME question from the image and solve it step by step", image_b64)
-    await update.message.reply_text(f"📸 *Solution:*\n\n{answer}", parse_mode='Markdown')
-
-# ========== VOICE SOLVER ==========
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not OPENAI_API_KEY:
-        await update.message.reply_text("❌ AI service not configured")
-        return
-
-    await update.message.reply_text("🎤 Transcribing your voice...")
-
-    voice = update.message.voice
-    file = await context.bot.get_file(voice.file_id)
-    voice_bytes = await file.download_as_bytearray()
-
-    try:
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-        data = aiohttp.FormData()
-        data.add_field('file', voice_bytes, filename='voice.ogg', content_type='audio/ogg')
-        data.add_field('model', 'whisper-1')
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post("https://api.openai.com/v1/audio/transcriptions", headers=headers, data=data) as resp:
-                transcript = await resp.json()
-
-        if 'error' in transcript:
-            await update.message.reply_text(f"❌ Voice error: {transcript['error']['message']}")
-            return
-
-        text = transcript.get('text', '').strip()
-        if not text:
-            await update.message.reply_text("❌ Couldn't hear you. Speak clearly please")
-            return
-
-        await update.message.reply_text(f"📝 You said: *{text}*\n\n🤖 Solving...")
-        answer = await solve_with_ai(text)
-        await update.message.reply_text(f"🔊 *Answer:*\n\n{answer}", parse_mode='Markdown')
-    except Exception as e:
-        await update.message.reply_text(f"❌ Voice error: {str(e)}")
 
 # ========== CBT LOGIC ==========
 async def start_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -302,7 +225,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "profile":
         await profile(update, context)
     elif data == "upgrade":
-        text = f"🏦 *Premium Activation - ₦500*\n\nAccount: `{BANK_ACC}`\nBank: {BANK_NAME}\nName: {BANK_OWNER}\n\n1. Transfer ₦500\n2. Send receipt photo here\n3. Admin approves instantly"
+        text = f"🏦 *Premium Activation - ₦500*\n\nAccount: `{BANK_ACC}`\nBank: {BANK_NAME}\nName: {BANK_OWNER}\n\n1. Transfer ₦500\n2. Send receipt photo to admin\n3. Admin go approve you manually"
         await query.edit_message_text(text, parse_mode='Markdown')
     elif data.startswith("ans_"):
         await handle_answer(update, context)
@@ -323,11 +246,10 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CallbackQueryHandler(buttons))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    print("ScholarAI Bot is LIVE! Photo + Voice + CBT enabled")
+    print("ScholarAI CBT Bot is LIVE! No OpenAI needed")
     app.run_polling()
 
 if __name__ == '__main__':
+    import asyncio
     main()
