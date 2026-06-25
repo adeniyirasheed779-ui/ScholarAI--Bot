@@ -1,235 +1,333 @@
 import os
-import json
-import html
-
+import csv
+import random
+import asyncio
+import sqlite3
+import base64
+import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_ID = 6975323735  # Your Telegram ID
-DB_FILE = "users.json"
+# ========== CONFIG - CHANGE THESE ==========
+TOKEN = os.getenv("BOT_TOKEN") # Get from @BotFather
+ADMIN_ID = 6975323735 # Your Telegram ID from @userinfobot
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # Get free key from platform.openai.com
 
-ACCOUNT_DETAILS = """🏦 <b>Account Number:</b> 5266508825
-🏦 <b>Bank:</b> Moniepoint MFB
-🏦 <b>Account Name:</b> RASHEED ADENIYI
+QUESTION_FILE = "questions.csv"
+DB_FILE = "users.db"
+FREE_LIMIT = 10
+PREMIUM_LIMIT = 40
+BANK_ACC = "5266508825"
+BANK_NAME = "Moniepoint MFB"
+BANK_OWNER = "RASHEED ADENIYI"
 
-<b>Amount:</b> ₦500 one-time for JAMB 2027/2028
+# ========== DATABASE ==========
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            is_premium INTEGER DEFAULT 0,
+            tests_done INTEGER DEFAULT 0,
+            total_correct INTEGER DEFAULT 0,
+            total_questions INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-After transfer, send payment screenshot here as a photo.
-Need help? DM me on Telegram for support @Hardee01
-"""
+def ensure_user(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO users (user_id) VALUES(?)', (user_id,))
+    conn.commit()
+    conn.close()
 
-QUESTIONS_DB = {
-    "English": [
-        {"q": "Choose the correct spelling: 2027/2028 JAMB SAMPLE", "a": "Accommodate", "opts": ["Accomodate", "Accommodate", "Acommodate", "Accomodatte"]},
-        {"q": "Select the synonym of 'Huge'", "a": "Massive", "opts": ["Small", "Tiny", "Massive", "Short"]},
-        {"q": "The boy ___ to school every day", "a": "goes", "opts": ["go", "goes", "going", "went"]},
-    ] + [{"q": f"English SAMPLE Q{i+4} 2027/2028", "a": "Option C", "opts": ["Option A", "Option B", "Option C", "Option D"]} for i in range(37)],
+def check_premium(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT is_premium FROM users WHERE user_id =?', (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return True if row and row[0] == 1 else False
 
-    "Mathematics": [
-        {"q": "If x + 5 = 12, x = ?", "a": "7", "opts": ["5", "6", "7", "17"]},
-        {"q": "Solve: 2x + 3 = 11", "a": "4", "opts": ["3", "4", "5", "8"]},
-        {"q": "Area of rectangle 5cm x 3cm?", "a": "15cm²", "opts": ["8cm²", "15cm²", "10cm²", "20cm²"]},
-    ] + [{"q": f"Maths SAMPLE Q{i+4} 2027/2028", "a": "10", "opts": ["5", "8", "10", "12"]} for i in range(37)],
+def upgrade_user(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO users (user_id, is_premium) VALUES(?, 1) ON CONFLICT(user_id) DO UPDATE SET is_premium = 1', (user_id,))
+    conn.commit()
+    conn.close()
 
-    "Biology": [
-        {"q": "The powerhouse of the cell is?", "a": "Mitochondria", "opts": ["Nucleus", "Ribosome", "Mitochondria", "Chloroplast"]},
-        {"q": "Which is NOT a mammal?", "a": "Shark", "opts": ["Whale", "Bat", "Shark", "Dolphin"]},
-        {"q": "Photosynthesis occurs in?", "a": "Chloroplast", "opts": ["Root", "Stem", "Chloroplast", "Flower"]},
-    ] + [{"q": f"Biology SAMPLE Q{i+4} 2027/2028", "a": "Blood", "opts": ["Bone", "Muscle", "Blood", "Skin"]} for i in range(37)],
+def update_stats(user_id, correct, total):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET tests_done = tests_done + 1, total_correct = total_correct +?, total_questions = total_questions +? WHERE user_id =?', (correct, total, user_id))
+    conn.commit()
+    conn.close()
 
-    "Chemistry": [
-        {"q": "Chemical symbol for Sodium?", "a": "Na", "opts": ["S", "So", "Na", "Sd"]},
-        {"q": "pH of pure water?", "a": "7", "opts": ["0", "7", "14", "10"]},
-        {"q": "H2O is formula for?", "a": "Water", "opts": ["Salt", "Water", "Oxygen", "Hydrogen"]},
-    ] + [{"q": f"Chemistry SAMPLE Q{i+4} 2027/2028", "a": "Acid", "opts": ["Base", "Salt", "Acid", "Metal"]} for i in range(37)],
-}
+def get_profile(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT tests_done, total_correct, total_questions FROM users WHERE user_id =?', (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
 
-def load_data():
+# ========== LOAD QUESTIONS ==========
+def load_questions():
+    question_bank = {}
+    if not os.path.exists(QUESTION_FILE):
+        with open(QUESTION_FILE, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['subject','question','option_a','option_b','option_c','option_d','answer','explanation'])
+            writer.writerow(['English','Select nearest meaning to Diligent','Lazy','Hardworking','Careless','Idle','Hardworking','Diligent means showing careful persistent work.'])
+            writer.writerow(['Maths','What is 2+2?','3','4','5','6','4','Basic addition'])
+
+    with open(QUESTION_FILE, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sub = row.get('subject', 'General').strip()
+            if not row.get('question'): continue
+            if sub not in question_bank: question_bank[sub] = []
+            question_bank[sub].append(row)
+    return question_bank
+
+QUESTION_BANK = load_questions()
+user_sessions = {}
+
+# ========== AI SOLVER ==========
+async def solve_with_ai(prompt, image_b64=None):
+    if not OPENAI_API_KEY:
+        return "❌ AI not configured. Admin needs to set OPENAI_API_KEY"
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    content = [{"type": "text", "text": f"You are JAMB/UTME tutor. Solve this clearly: {prompt}. Give final answer with option A/B/C/D + 1-2 line explanation"}]
+
+    if image_b64:
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
+
+    payload = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": content}], "max_tokens": 350}
+
     try:
-        if os.path.exists(DB_FILE):
-            with open(DB_FILE, "r") as f:
-                content = f.read().strip()
-                if content:
-                    return json.loads(content)
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload) as resp:
+                data = await resp.json()
+                return data['choices'][0]['message']['content']
     except Exception as e:
-        print(f"Database read error: {e}")
-    return {}
+        return f"❌ AI Error: {str(e)}"
 
-def save_data(data):
-    try:
-        with open(DB_FILE, "w") as f:
-            json.dump(data, f, indent=4)
-    except Exception as e:
-        print(f"Database write error: {e}")
-
-USER_DATA = load_data()
-
-def is_premium(user_id):
-    return str(user_id) in USER_DATA and USER_DATA[str(user_id)].get("premium", False)
-
-def get_questions(subject, user_id):
-    questions = QUESTIONS_DB.get(subject, [])
-    return questions[:40] if is_premium(user_id) else questions[:20]
-
+# ========== /START ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    uid = str(user_id)
-    
-    # Initialize profile state if missing entirely
-    if uid not in USER_DATA:
-        USER_DATA[uid] = {"premium": False}
+    ensure_user(user_id)
+    is_premium = check_premium(user_id)
+
+    tier_tag = "👑 PREMIUM" if is_premium else "🆓 FREE"
+    text = f"🚀 *ScholarAI JAMB/UTME Bot* [{tier_tag}]\n\n"
+    text += f"Free: {FREE_LIMIT} questions per subject\nPremium: {PREMIUM_LIMIT} questions\n"
+    text += "📚 Tap subject for CBT test\n📸 Send photo of any question\n🎤 Send voice note to ask\n📊 /profile for stats"
+
+    keyboard = []
+    for subject in QUESTION_BANK.keys():
+        keyboard.append([InlineKeyboardButton(f"📚 {subject}", callback_data=f"subject_{subject}")])
+    if not is_premium:
+        keyboard.append([InlineKeyboardButton("🔑 Upgrade Premium ₦500", callback_data="upgrade")])
+    keyboard.append([InlineKeyboardButton("📊 My Profile", callback_data="profile")])
+
+    if update.message:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     else:
-        # Clear out current testing metrics safely on refresh
-        for key in ["subject", "q_index", "score"]:
-            USER_DATA[uid].pop(key, None)
-    save_data(USER_DATA)
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-    keyboard = [
-        [InlineKeyboardButton("📚 English", callback_data="subj_English")],
-        [InlineKeyboardButton("➗ Mathematics", callback_data="subj_Mathematics")],
-        [InlineKeyboardButton("🧬 Biology", callback_data="subj_Biology")],
-        [InlineKeyboardButton("⚗️ Chemistry", callback_data="subj_Chemistry")],
-        [InlineKeyboardButton("💎 Upgrade to Premium ₦500", callback_data="upgrade")]
-    ]
-    status = "<b>PREMIUM ✅</b>" if is_premium(user_id) else "<b>FREE - 20 Qs only</b>"
-    text = f"""Welcome to JAMB 2027/2028 CBT Prep Bot! 🚀
+# ========== /PROFILE ==========
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    row = get_profile(user_id)
 
-Status: {status}
-Choose a subject to start practice.
+    if not row or row[2] == 0:
+        text = "📊 *No tests yet*\nStart practicing with /start"
+    else:
+        acc = round(row[1]/row[2]*100, 1) if row[2] > 0 else 0
+        text = f"📊 *Your ScholarAI Stats*\n\nTests done: {row[0]}\nQuestions: {row[2]}\nCorrect: {row[1]}\nAccuracy: {acc}%\n\nKeep grinding! 💪"
 
-Free users get first 20 questions.
-Premium ₦500 unlocks all 40 questions per subject.
+    if update.message:
+        await update.message.reply_text(text, parse_mode='Markdown')
+    else:
+        await update.callback_query.edit_message_text(text, parse_mode='Markdown')
 
-Need help? DM me on Telegram for support @Hardee01"""
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-    uid = str(user_id)
-
-    if data == "upgrade":
-        await query.message.reply_text(ACCOUNT_DETAILS, parse_mode="HTML")
-        USER_DATA[uid] = USER_DATA.get(uid, {"premium": False})
-        USER_DATA[uid]["awaiting_payment"] = True
-        save_data(USER_DATA)
+# ========== PHOTO SOLVER ==========
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not OPENAI_API_KEY:
+        await update.message.reply_text("❌ AI service not configured")
         return
 
-    if data.startswith("subj_"):
-        subject = data.split("_", 1)[1]
-        questions = get_questions(subject, user_id)
-        if not questions:
-            await query.message.reply_text("No questions for this subject yet.")
+    await update.message.reply_text("👀 Reading your question... 3-5 secs")
+
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    image_bytes = await file.download_as_bytearray()
+    image_b64 = base64.b64encode(image_bytes).decode('utf-8')
+
+    answer = await solve_with_ai("Read this JAMB/UTME question from the image and solve it step by step", image_b64)
+    await update.message.reply_text(f"📸 *Solution:*\n\n{answer}", parse_mode='Markdown')
+
+# ========== VOICE SOLVER ==========
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not OPENAI_API_KEY:
+        await update.message.reply_text("❌ AI service not configured")
+        return
+
+    await update.message.reply_text("🎤 Transcribing your voice...")
+
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+    voice_bytes = await file.download_as_bytearray()
+
+    try:
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        data = aiohttp.FormData()
+        data.add_field('file', voice_bytes, filename='voice.ogg', content_type='audio/ogg')
+        data.add_field('model', 'whisper-1')
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://api.openai.com/v1/audio/transcriptions", headers=headers, data=data) as resp:
+                transcript = await resp.json()
+
+        if 'error' in transcript:
+            await update.message.reply_text(f"❌ Voice error: {transcript['error']['message']}")
             return
 
-        USER_DATA[uid] = USER_DATA.get(uid, {"premium": False})
-        USER_DATA[uid]["subject"] = subject
-        USER_DATA[uid]["q_index"] = 0
-        USER_DATA[uid]["score"] = 0
-        save_data(USER_DATA)
-        
-        await send_question(query, user_id, questions[0], feedback="")
+        text = transcript.get('text', '').strip()
+        if not text:
+            await update.message.reply_text("❌ Couldn't hear you. Speak clearly please")
+            return
 
-async def send_question(query, user_id, q_data, feedback=""):
-    keyboard = [[InlineKeyboardButton(opt, callback_data=f"ans_{i}")] for i, opt in enumerate(q_data["opts"])]
-    uid = str(user_id)
-    
-    prefix = f"{feedback}\n\n" if feedback else ""
-    safe_q = html.escape(q_data["q"])
-    text = f"{prefix}📝 <b>Question {USER_DATA[uid]['q_index'] + 1}</b>:\n\n{safe_q}"
-    
+        await update.message.reply_text(f"📝 You said: *{text}*\n\n🤖 Solving...")
+        answer = await solve_with_ai(text)
+        await update.message.reply_text(f"🔊 *Answer:*\n\n{answer}", parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"❌ Voice error: {str(e)}")
+
+# ========== CBT LOGIC ==========
+async def start_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    subject = query.data.replace("subject_", "")
+    user_id = update.effective_user.id
+    is_premium = check_premium(user_id)
+
+    qs = QUESTION_BANK.get(subject, [])
+    if not qs:
+        await query.answer("No questions for this subject yet!", show_alert=True)
+        return
+
+    limit = PREMIUM_LIMIT if is_premium else FREE_LIMIT
+    limit = min(len(qs), limit)
+    selected = random.sample(qs, limit)
+
+    user_sessions[user_id] = {'subject': subject, 'questions': selected, 'limit': limit, 'current': 0, 'score': 0}
+    await show_question(update, context)
+
+async def show_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    test = user_sessions[user_id]
+    q = test['questions'][test['current']]
+
+    options = [('A', q.get('option_a','')), ('B', q.get('option_b','')), ('C', q.get('option_c','')), ('D', q.get('option_d',''))]
+    random.shuffle(options)
+
     try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-    except Exception:
-        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        correct = next(l for l, t in options if t.strip() == q.get('answer','').strip())
+    except:
+        correct = 'A'
 
-async def answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    test['correct'] = correct
+    test['exp'] = q.get('explanation', 'No explanation provided')
+
+    text = f"*Q{test['current']+1}/{test['limit']} - {test['subject']}*\n\n{q.get('question')}\n\n"
+    keyboard = [[InlineKeyboardButton(f"{l}. {t[:50]}", callback_data=f"ans_{l}")] for l, t in options]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    if user_id not in user_sessions: return
+
+    test = user_sessions[user_id]
+    chosen = query.data.replace("ans_", "")
+
+    if chosen == test['correct']:
+        test['score'] += 1
+        fb = "✅ Correct!"
+    else:
+        fb = f"❌ Wrong! Answer: {test['correct']}"
+
+    await query.edit_message_text(f"{fb}\n\n💡 {test['exp']}", parse_mode='Markdown')
+    test['current'] += 1
+    await asyncio.sleep(2)
+
+    if test['current'] < test['limit']:
+        await show_question(update, context)
+    else:
+        update_stats(user_id, test['score'], test['limit'])
+        perc = round(test['score']/test['limit']*100, 1)
+        text = f"🎉 *Test Complete!*\n\nSubject: {test['subject']}\nScore: {test['score']}/{test['limit']} = {perc}%\n\n"
+        if perc >= 70: text += "🔥 JAMB Ready!"
+        elif perc >= 50: text += "💪 Good! Keep practicing"
+        else: text += "📚 Study explanations and retry"
+
+        if not check_premium(user_id):
+            text += "\n\n🔑 Upgrade to Premium for 40 questions!"
+
+        keyboard = [
+            [InlineKeyboardButton("🔄 Retake", callback_data=f"subject_{test['subject']}")],
+            [InlineKeyboardButton("🏠 Home", callback_data="home")],
+            [InlineKeyboardButton("📊 Profile", callback_data="profile")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        del user_sessions[user_id]
+
+# ========== BUTTON ROUTER ==========
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    uid = str(user_id)
-
-    if uid not in USER_DATA or "subject" not in USER_DATA[uid]:
-        return
-
-    choice_idx = int(query.data.split("_", 1)[1])
-    subject = USER_DATA[uid]["subject"]
-    q_index = USER_DATA[uid]["q_index"]
-    questions = get_questions(subject, user_id)
-    
-    if q_index >= len(questions):
-        return
-
-    q_data = questions[q_index]
-    chosen = q_data["opts"][choice_idx]
-    correct = q_data["a"]
-
-    if chosen == correct:
-        USER_DATA[uid]["score"] += 1
-        result = "✅ <b>Correct!</b>"
-    else:
-        result = f"❌ <b>Wrong!</b> Correct answer: <code>{html.escape(correct)}</code>"
-
-    USER_DATA[uid]["q_index"] += 1
-    save_data(USER_DATA)
-
-    if USER_DATA[uid]["q_index"] >= len(questions):
-        score = USER_DATA[uid]["score"]
-        total = len(questions)
-        await query.message.edit_text(
-            f"{result}\n\n🏁 <b>Quiz complete!</b>\nFinal Score: <code>{score}/{total}</code>\n\nRun /start to launch a new session.", 
-            parse_mode="HTML"
-        )
-        for key in ["subject", "q_index", "score"]:
-            USER_DATA[uid].pop(key, None)
-        save_data(USER_DATA)
-    else:
-        await send_question(query, user_id, questions[USER_DATA[uid]["q_index"]], feedback=result)
-
-async def payment_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = query.data
     user_id = update.effective_user.id
-    uid = str(user_id)
-    
-    if uid in USER_DATA and USER_DATA[uid].get("awaiting_payment"):
-        await context.bot.forward_message(chat_id=ADMIN_ID, from_chat_id=user_id, message_id=update.message.message_id)
-        await context.bot.send_message(
-            chat_id=ADMIN_ID, 
-            text=f"💳 <b>Premium Upgrading Request</b>\nUser System ID: <code>{user_id}</code>\n\nTo grant authorization, copy and send:\n<code>/approve {user_id}</code>", 
-            parse_mode="HTML"
-        )
-        
-        await update.message.reply_text("Screenshot forwarded to admin for verification. You will be upgraded once confirmed! ⌛")
-        USER_DATA[uid]["awaiting_payment"] = False
-        save_data(USER_DATA)
 
-async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if context.args:
-        target_id = str(context.args[0])
-        USER_DATA[target_id] = USER_DATA.get(target_id, {})
-        USER_DATA[target_id]["premium"] = True
-        save_data(USER_DATA)
-        
-        try:
-            await context.bot.send_message(chat_id=int(target_id), text="🎉 Payment confirmed! You now have PREMIUM access to all 40 questions per subject for JAMB 2027/2028!")
-            await update.message.reply_text(f"User {target_id} successfully upgraded to Premium ✅")
-        except Exception as e:
-            await update.message.reply_text(f"Database adjusted successfully, but direct notification to chat could not deliver: {e}")
+    if data.startswith("subject_"):
+        await start_test(update, context)
+    elif data == "home":
+        await start(update, context)
+    elif data == "profile":
+        await profile(update, context)
+    elif data == "upgrade":
+        text = f"🏦 *Premium Activation - ₦500*\n\nAccount: `{BANK_ACC}`\nBank: {BANK_NAME}\nName: {BANK_OWNER}\n\n1. Transfer ₦500\n2. Send receipt photo here\n3. Admin approves instantly"
+        await query.edit_message_text(text, parse_mode='Markdown')
+    elif data.startswith("ans_"):
+        await handle_answer(update, context)
+    elif data.startswith("approve_") and user_id == ADMIN_ID:
+        target = int(data.replace("approve_", ""))
+        upgrade_user(target)
+        await query.edit_message_text("✅ Approved!")
+        await context.bot.send_message(target, "🎉 Premium activated! Send /start to begin 40 questions")
 
+# ========== MAIN ==========
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    init_db()
+    if not TOKEN:
+        print("CRITICAL: Set BOT_TOKEN environment variable")
+        return
+
+    app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("approve", approve))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^subj_|^upgrade"))
-    app.add_handler(CallbackQueryHandler(answer_handler, pattern="^ans_\\d+$"))
-    app.add_handler(MessageHandler(filters.PHOTO, payment_screenshot))
-    
-    print("Bot running safely for JAMB 2027/2028...")
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CallbackQueryHandler(buttons))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+    print("ScholarAI Bot is LIVE! Photo + Voice + CBT enabled")
     app.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
